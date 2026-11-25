@@ -421,8 +421,8 @@ async def scenario_big_and_small(base, downloads, seconds):
     judge_latency("TST-14", baseline, loaded)
     await asyncio.gather(*tasks)
     check("TST-14 100MB 다운로드 %d개 모두 해시 일치" % downloads, all(results))
-    check("TST-14 전송 중 메모리가 파일 크기만큼 늘지 않음 (전 %d KB → 전송 중 %d KB)" % (before["rss"], peak["rss"]),
-          peak["rss"] - before["rss"] < 100 * 1024)
+    check("TST-14 전송 중 메모리 증가가 10MB 미만 (파일은 100MB, 전 %d KB → 전송 중 %d KB)" % (before["rss"], peak["rss"]),
+          peak["rss"] - before["rss"] < 10 * 1024)
     record("TST-14", baseline=baseline, loaded=loaded, rss_peak_kb=peak["rss"])
     check_recovered("TST-14", server, before)
     server.stop()
@@ -500,37 +500,48 @@ async def abrupt_client(port, index, mode):
         sock = writer.get_extra_info("socket")
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
         writer.close()
+        return True
     except Exception:
-        pass
+        return False
 
 
 async def run_abrupt_round(server, clients):
+    """끊기를 실제로 해낸 클라이언트 수를 돌려준다. 클라이언트가 먼저 실패하면 서버를 시험한 것이 아니다."""
+    succeeded = 0
     for start in range(0, clients, 500):
-        await asyncio.gather(*[abrupt_client(server.port, i, i % 3) for i in range(start, min(start + 500, clients))])
+        results = await asyncio.gather(*[abrupt_client(server.port, i, i % 3)
+                                         for i in range(start, min(start + 500, clients))])
+        succeeded += sum(1 for r in results if r)
     await asyncio.sleep(1)
+    return succeeded
 
 
 async def scenario_abrupt(base, clients):
     root, _ = make_files(base)
     server = Server(root)
     before = snapshot(server)
-    await run_abrupt_round(server, clients)
+    done_first = await run_abrupt_round(server, clients)
     await asyncio.sleep(10)
     first = snapshot(server)
-    await run_abrupt_round(server, clients)
+    done_second = await run_abrupt_round(server, clients)
+    check("TST-17 끊기 %d개 × 2회가 실제로 수행됨 (1회 %d, 2회 %d, 95%% 이상이어야 함)" % (clients, done_first, done_second),
+          min(done_first, done_second) >= clients * 0.95)
     reader, writer = await open_connection(server.port, 5)
     status, body = await fetch(reader, writer, "/small.txt")
     check("TST-17 대량 끊김 뒤에도 새 손님에게 정확한 응답", status == 200 and body == b"small")
     writer.close()
     await asyncio.sleep(10)
     second = snapshot(server)
-    record("TST-17", clients=clients, memory_after_rounds_kb=[first["rss"], second["rss"]])
+    record("TST-17", clients=clients, performed=[done_first, done_second],
+           memory_after_rounds_kb=[first["rss"], second["rss"]])
     check_recovered("TST-17", server, before, wait_seconds=3, stable_with=first)
     check("TST-17 서버 로그에 ERROR 없음", "[ERROR]" not in server.log_text())
     server.stop()
 
 
 # ---------- TST-18: 퍼징 ----------
+# 시드를 여러 개 돌려 매번 같은 입력만 보내지 않게 한다 (처음 값은 이전 실행과 같은 입력)
+FUZZ_SEEDS = (20261123, 7, 20240229)
 VALID = [b"GET /small.txt HTTP/1.1\r\nHost: t\r\n\r\n",
          b"POST /small.txt HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\nhello",
          b"GET /file_3.txt?a=b%20c HTTP/1.0\r\nUser-Agent: x\r\nAccept: */*\r\n\r\n"]
@@ -575,28 +586,38 @@ async def scenario_fuzz(base, count):
     root, _ = make_files(base)
     server = Server(root)
     before = snapshot(server)
-    rng = random.Random(20261123)
-    inputs = [make_fuzz_input(rng) for _ in range(count)]
-    results = [None] * count
-    for start in range(0, count, 200):
-        await asyncio.gather(*[fuzz_client(server.port, inputs[i], results, i)
-                               for i in range(start, min(start + 200, count))])
-    unexpected = 0
-    for head in results:
-        if head:
-            match = re.match(rb"HTTP/1\.1 (\d{3})", head)
-            code = int(match.group(1)) if match else 0
-            if code not in (200, 301, 400, 403, 404, 405, 411, 413, 414, 417, 431, 501, 505):
-                unexpected += 1
-    check("TST-18 이상한 요청 %d개: 정해진 코드로 응답하거나 연결을 닫음 (예상 밖 %d)" % (count, unexpected),
+    unexpected = responded = closed_without_reply = waiting = 0
+    for seed in FUZZ_SEEDS:
+        rng = random.Random(seed)
+        inputs = [make_fuzz_input(rng) for _ in range(count)]
+        results = [None] * count
+        for start in range(0, count, 200):
+            await asyncio.gather(*[fuzz_client(server.port, inputs[i], results, i)
+                                   for i in range(start, min(start + 200, count))])
+        for head in results:
+            if head is None:
+                waiting += 1            # 1초 안에 응답도 종료도 없음: 덜 온 요청을 기다리는 서버의 정상 동작
+            elif head == b"":
+                closed_without_reply += 1   # 응답 없이 연결이 끊김(서버가 닫았거나 연결 실패)
+            else:
+                responded += 1
+                match = re.match(rb"HTTP/1\.1 (\d{3})", head)
+                code = int(match.group(1)) if match else 0
+                if code not in (200, 301, 400, 403, 404, 405, 411, 413, 414, 417, 431, 501, 505):
+                    unexpected += 1
+    total = count * len(FUZZ_SEEDS)
+    check("TST-18 이상한 요청 %d개(시드 %d개): 응답한 %d개 중 예상 밖 코드 %d" % (total, len(FUZZ_SEEDS), responded, unexpected),
           unexpected == 0)
+    check("TST-18 응답 없이 연결만 끊긴 입력이 전체의 5%% 미만 (%d / %d, 기다림 %d)"
+          % (closed_without_reply, total, waiting), closed_without_reply * 20 < total)
     check("TST-18 서버 생존", server.is_alive)
     time.sleep(17)
     reader, writer = await open_connection(server.port, 5)
     status, body = await fetch(reader, writer, "/small.txt")
     check("TST-18 퍼징 뒤 새 손님에게 정확한 응답", status == 200 and body == b"small")
     writer.close()
-    record("TST-18", inputs=count, unexpected=unexpected)
+    record("TST-18", inputs=total, seeds=list(FUZZ_SEEDS), responded=responded,
+           closed_without_reply=closed_without_reply, waiting=waiting, unexpected=unexpected)
     check_recovered("TST-18", server, before, wait_seconds=1)
     check("TST-18 서버 로그에 ERROR 없음", "[ERROR]" not in server.log_text())
     server.stop()
@@ -644,6 +665,18 @@ async def scenario_backend_trouble(base, seconds):
 
 
 # ---------- TST-20: 장시간 실행 ----------
+def rss_slope_kb_per_minute(samples):
+    """시간에 따른 메모리의 최소제곱 기울기. 앞뒤 평균만 비교하면 느리게 새는 누수를 놓치므로 함께 본다."""
+    xs = [s["minute"] for s in samples]
+    ys = [s["rss"] for s in samples]
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    spread = sum((x - mean_x) ** 2 for x in xs)
+    if spread == 0:
+        return 0.0
+    return sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / spread
+
+
 async def scenario_long_run(base, minutes):
     root, digest = make_files(base)
     python_backend = PythonBackend()
@@ -675,8 +708,14 @@ async def scenario_long_run(base, minutes):
     last = warm[-max(len(warm) // 3, 1):]
     rss_first = sum(s["rss"] for s in first) / len(first)
     rss_last = sum(s["rss"] for s in last) / len(last)
-    check("TST-20 메모리가 계속 늘지 않음 (앞 %.0f KB → 뒤 %.0f KB)" % (rss_first, rss_last),
-          rss_last <= rss_first * 1.15 + 5000)
+    check("TST-20 메모리가 계속 늘지 않음 (앞 %.0f KB → 뒤 %.0f KB, 허용 앞 × 1.15 + 1MB)" % (rss_first, rss_last),
+          rss_last <= rss_first * 1.15 + 1024)
+    if minutes >= 10:
+        slope = rss_slope_kb_per_minute(warm)
+        check("TST-20 메모리 증가 기울기가 분당 50KB 이하 (%.1f KB/분, 30분이면 %.0f KB)" % (slope, slope * 30),
+              slope <= 50)
+    else:
+        print("  건너뜀  TST-20 기울기 검사는 10분 이상 실행에서만 한다 (이번 %.1f분)" % minutes)
     check("TST-20 fd가 계속 늘지 않음 (앞 %d → 뒤 %d)" % (first[0]["fd"], last[-1]["fd"]),
           last[-1]["fd"] <= first[0]["fd"] + 5)
     record("TST-20", minutes=minutes, samples=samples)

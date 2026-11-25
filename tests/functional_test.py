@@ -101,7 +101,7 @@ def test_static(port, root):
     check("405 정적 파일에 POST + Allow: GET, HEAD",
           post.status == 405 and post.header("Allow") == "GET, HEAD")
     check("405 뒤에는 연결 유지(본문을 버리고 다음 요청 처리)", not closed)
-    check("414 너무 긴 경로", get(port, "/" + "a" * 5000).status in (404, 414))
+    check("414 너무 긴 경로", get(port, "/" + "a" * 5000).status == 414)
     check("414 이름 하나가 NAME_MAX 초과", get(port, "/" + "a" * 300).status == 414)
 
 
@@ -353,6 +353,7 @@ def test_fd_exhaustion(root):
                 break
         except OSError:
             continue
+    # fd 표가 가득 차 있으면 서버가 파일을 열지 못해 500이 정상이고, 자리가 있으면 200이다. 둘 다 형식이 맞아야 한다.
     check("이미 연결된 손님에게 형식이 맞는 응답 (fd 표가 가득 차 파일을 못 열면 500: 상태 %s)"
           % (response.status if response else None),
           response is not None and response.status in (200, 500)
@@ -440,7 +441,7 @@ def test_connect_timeout(base, root):
     if response.status == 504:
         check("연결이 안 되는 주소 → 연결 타임아웃(1초) 뒤 504 (%.2f초)" % elapsed, 0.9 < elapsed < 1.5)
     else:
-        print("  참고  이 네트워크는 192.0.2.1에 즉시 실패를 돌려줘 연결 타임아웃을 재현하지 못함 (상태 %d, %.1f초)"
+        print("  건너뜀  이 네트워크는 192.0.2.1에 즉시 실패를 돌려줘 연결 타임아웃을 재현하지 못함, 검사하지 않음 (상태 %d, %.1f초)"
               % (response.status, elapsed))
     server.stop()
 
